@@ -1,0 +1,8 @@
+.output
+node_modules
+nohup.out
+.env
+.DS_Store
+tmp/
+.wxt/
+wxt.config.ts.timestamp
