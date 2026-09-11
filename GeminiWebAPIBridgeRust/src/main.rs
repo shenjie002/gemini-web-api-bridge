@@ -18,6 +18,8 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     env,
+    fs::{create_dir_all, OpenOptions},
+    io::Write,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -26,11 +28,49 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-const GEMINI_ORIGIN: &str = "[https://gemini.google.com](https://gemini.google.com)";
+const GEMINI_ORIGIN: &str = "https://gemini.google.com";
 const USER_AGENT_VAL: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
 const SESSION_TTL_SECS: u64 = 10 * 60; // 10 minutes
 
+// ── Structured JSONL logger ──────────────────────────────────────────
+//
+// Appends one JSON object per line to `logs/bridge-YYYY-MM-DD.log`, using
+// the same shape as the Node version (`{"ts":...,"stage":...,...}`).
+// Failures are swallowed so logging never breaks the request path.
+fn log_event(stage: &str, extra: Value) {
+    let now = Utc::now();
+    let mut obj = serde_json::Map::new();
+    obj.insert("ts".to_string(), Value::String(now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)));
+    obj.insert("stage".to_string(), Value::String(stage.to_string()));
+    if let Value::Object(map) = extra {
+        for (k, v) in map {
+            obj.insert(k, v);
+        }
+    }
+    let line = match serde_json::to_string(&Value::Object(obj)) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    // Also emit to tracing so terminal output stays intact.
+    info!("{}", line);
+
+    let date = now.format("%Y-%m-%d").to_string();
+    tokio::task::spawn_blocking(move || {
+        let dir = std::path::PathBuf::from("logs");
+        if create_dir_all(&dir).is_ok() {
+            let path = dir.join(format!("bridge-{}.log", date));
+            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
+                let _ = writeln!(f, "{}", line);
+            }
+        }
+    });
+}
+
 // ── Models & State ───────────────────────────────────────────────────
+
+const CONVERSATION_TTL_SECS: u64 = 2 * 60 * 60; // 2 hours
+const MAX_CONVERSATIONS: usize = 500;
 
 #[derive(Debug, Clone, Default)]
 struct SessionParams {
@@ -41,12 +81,29 @@ struct SessionParams {
     last_refresh_epoch: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct ConversationContext {
     cid: String,
     rid: String,
     choice_id: String,
     continuation_token: Option<String>,
+    last_accessed: u64,
+}
+
+fn prune_stale_conversations(map: &mut HashMap<String, ConversationContext>, now: u64) {
+    map.retain(|_, ctx| now.saturating_sub(ctx.last_accessed) < CONVERSATION_TTL_SECS);
+
+    if map.len() > MAX_CONVERSATIONS {
+        let mut entries: Vec<(String, u64)> = map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.last_accessed))
+            .collect();
+        entries.sort_by_key(|(_, t)| *t);
+        let remove_count = map.len() - MAX_CONVERSATIONS;
+        for (k, _) in entries.into_iter().take(remove_count) {
+            map.remove(&k);
+        }
+    }
 }
 
 struct AppState {
@@ -72,7 +129,12 @@ struct CookieSyncPayload {
 struct CompletionMessage {
     #[allow(dead_code)]
     role: Option<String>,
-    content: Option<String>,
+    // Pi sends `content` as either a plain string OR a structured array
+    // like `[{type:"text",text:"..."}, {type:"toolCall",...}]`. We don't
+    // actually parse messages here (the full formatted prompt arrives in
+    // `prompt`), but we still need to accept any shape without failing
+    // deserialization.
+    content: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,6 +224,7 @@ async fn refresh_session(state: &AppState) -> Result<SessionParams, String> {
     }
 
     info!("🔄 [session_refresh] Starting refresh from Gemini page...");
+    log_event("session_refresh", json!({ "status": "starting" }));
 
     let resp = state
         .http_client
@@ -254,6 +317,14 @@ async fn refresh_session(state: &AppState) -> Result<SessionParams, String> {
         !new_params.fsid.is_empty(),
         new_params.cfb2h.is_some()
     );
+    log_event("session_refresh", json!({
+        "status": "done",
+        "hasAtToken": !new_params.at_token.is_empty(),
+        "hasBl": !new_params.bl.is_empty(),
+        "hasFsid": !new_params.fsid.is_empty(),
+        "hasCfb2h": new_params.cfb2h.is_some(),
+        "bl": new_params.bl.clone(),
+    }));
 
     let mut lock = state.session_params.write().await;
     *lock = new_params.clone();
@@ -497,6 +568,26 @@ fn extract_response_text_with_status(data: &Value) -> Option<InnerTextExtract> {
     None
 }
 
+// Extract a flat text string from a Pi message `content` field, which may
+// be a plain string or an array of content blocks like
+// [{type:"text",text:"..."}, {type:"toolCall",...}, ...].
+fn extract_content_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(|block| {
+                block
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
 fn find_response_text_brute_force(raw: &str) -> Option<String> {
     let re = Regex::new(r#""((?:[^"\\]|\\.)*)""#).ok()?;
     let mut matches = Vec::new();
@@ -688,6 +779,10 @@ async fn call_gemini_api(
         prompt.len(),
         &url[..url.len().min(100)]
     );
+    log_event("gemini_api_call", json!({
+        "promptLength": prompt.len(),
+        "url": &url[..url.len().min(100)],
+    }));
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -698,13 +793,19 @@ async fn call_gemini_api(
     headers.insert(ORIGIN, HeaderValue::from_static(GEMINI_ORIGIN));
     headers.insert(
         REFERER,
-        HeaderValue::from_static("[https://gemini.google.com/](https://gemini.google.com/)"),
+        HeaderValue::from_static("https://gemini.google.com/"),
     );
     headers.insert("X-Same-Domain", HeaderValue::from_static("1"));
     headers.insert(ACCEPT, HeaderValue::from_static("*/*"));
     headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
-    if let Ok(val) = HeaderValue::from_str(&cookies) {
-        headers.insert(COOKIE, val);
+    match HeaderValue::from_str(&cookies) {
+        Ok(val) => {
+            headers.insert(COOKIE, val);
+        }
+        Err(e) => {
+            error!("❌ [gemini_api_call] Failed to serialize cookies into HeaderValue: {}", e);
+            return Err(format!("Invalid cookie characters for HeaderValue: {}", e));
+        }
     }
 
     let resp = state
@@ -723,6 +824,10 @@ async fn call_gemini_api(
         .map_err(|e| format!("Failed to read response body: {}", e))?;
 
     if !status.is_success() {
+        log_event("gemini_api_error", json!({
+            "status": status.as_u16(),
+            "bodyPreview": body_text.chars().take(300).collect::<String>(),
+        }));
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
             // Auth failed: reset token to trigger refresh next time
             let mut lock = state.session_params.write().await;
@@ -736,7 +841,21 @@ async fn call_gemini_api(
         ));
     }
 
-    parse_gemini_response(&body_text)
+    log_event("parse_response", json!({ "rawLength": body_text.len() }));
+    let parsed = parse_gemini_response(&body_text);
+    match &parsed {
+        Ok(res) => log_event("parse_success", json!({
+            "resultLength": res.text.len(),
+            "truncated": res.truncated,
+            "geminiError": res.gemini_error.clone(),
+            "cid": res.cid.clone().unwrap_or_default(),
+            "rid": res.rid.clone().unwrap_or_default(),
+            "hasContinuationToken": res.continuation_token.is_some(),
+            "preview": res.text.chars().take(200).collect::<String>(),
+        })),
+        Err(e) => log_event("parse_failed", json!({ "error": e })),
+    }
+    parsed
 }
 
 // ── HTTP Handlers ────────────────────────────────────────────────────
@@ -795,6 +914,10 @@ async fn cookies_post_handler(
             cookie_len
         );
     }
+    log_event("cookies_synced", json!({
+        "cookieLength": cookie_len,
+        "cookiesChanged": cookies_changed,
+    }));
 
     Json(json!({ "ok": true, "cookieLength": cookie_len })).into_response()
 }
@@ -844,12 +967,22 @@ async fn completions_handler(
     let prompt = if let Some(p) = payload.prompt {
         p
     } else if let Some(msgs) = payload.messages {
-        msgs.last().and_then(|m| m.content.clone()).unwrap_or_default()
+        // Best-effort text extraction from the last message. Handles both
+        // shapes: plain string, or array of content blocks (concatenates
+        // any `text` fields).
+        msgs.last()
+            .and_then(|m| m.content.as_ref())
+            .map(extract_content_text)
+            .unwrap_or_default()
     } else {
         String::new()
     };
 
     if prompt.trim().is_empty() {
+        log_event("completion_error", json!({
+            "requestId": &request_id,
+            "error": "No prompt provided",
+        }));
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "No prompt provided", "requestId": request_id })),
@@ -865,6 +998,11 @@ async fn completions_handler(
         prompt.len(),
         conversation_id
     );
+    log_event("completion_request", json!({
+        "requestId": &request_id,
+        "promptLength": prompt.len(),
+        "conversationId": conversation_id.clone().unwrap_or_default(),
+    }));
 
     let has_cookies = !state.gemini_cookies.read().await.is_empty();
     if !has_cookies {
@@ -879,8 +1017,15 @@ async fn completions_handler(
     }
 
     let conv_context = if let Some(ref cid) = conversation_id {
-        let lock = state.conversations.read().await;
-        lock.get(cid).cloned()
+        let mut lock = state.conversations.write().await;
+        let now = now_epoch_secs();
+        prune_stale_conversations(&mut lock, now);
+        if let Some(ctx) = lock.get_mut(cid) {
+            ctx.last_accessed = now;
+            Some(ctx.clone())
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -888,6 +1033,11 @@ async fn completions_handler(
     let mut call_result = call_gemini_api(&state, &prompt, conv_context.as_ref()).await;
 
     if call_result.is_err() {
+        let err_msg = call_result.as_ref().err().cloned().unwrap_or_default();
+        log_event("completion_first_attempt_failed", json!({
+            "requestId": &request_id,
+            "error": err_msg,
+        }));
         let needs_refresh = { state.session_params.read().await.at_token.is_empty() };
         if needs_refresh {
             warn!("⚠️ First attempt failed with auth issue, attempting session refresh and retry...");
@@ -901,6 +1051,8 @@ async fn completions_handler(
         Ok(res) => {
             if let Some(ref conv_key) = conversation_id {
                 let mut lock = state.conversations.write().await;
+                let now = now_epoch_secs();
+                prune_stale_conversations(&mut lock, now);
                 if res.cid.is_some() && !res.truncated && res.gemini_error.is_none() && res.continuation_token.is_some() {
                     let new_cid = res.cid.as_ref().unwrap();
                     lock.insert(
@@ -910,19 +1062,30 @@ async fn completions_handler(
                             rid: res.rid.clone().unwrap_or_default(),
                             choice_id: res.choice_id.clone().unwrap_or_default(),
                             continuation_token: res.continuation_token.clone(),
+                            last_accessed: now,
                         },
                     );
                     info!(
                         "💬 [conversation_updated] convId={}, cid={}, rid={:?}, hasContinuationToken=true",
                         conv_key, new_cid, res.rid
                     );
+                    log_event("conversation_updated", json!({
+                        "conversationId": conv_key,
+                        "cid": new_cid,
+                        "rid": res.rid.clone().unwrap_or_default(),
+                        "hasContinuationToken": true,
+                    }));
                 } else if res.truncated || res.gemini_error.is_some() {
                     lock.remove(conv_key);
+                    let reason = res.gemini_error.as_ref().map(|e| e.to_string()).unwrap_or_else(|| "truncated".to_string());
                     warn!(
                         "⚠️ [conversation_dropped] convId={}, reason={:?}",
-                        conv_key,
-                        res.gemini_error.as_ref().map(|e| e.to_string()).unwrap_or_else(|| "truncated".to_string())
+                        conv_key, reason
                     );
+                    log_event("conversation_dropped", json!({
+                        "conversationId": conv_key,
+                        "reason": reason,
+                    }));
                 }
             }
 
@@ -932,6 +1095,12 @@ async fn completions_handler(
                 res.text.len(),
                 res.truncated
             );
+            log_event("completion_success", json!({
+                "requestId": &request_id,
+                "responseLength": res.text.len(),
+                "truncated": res.truncated,
+                "geminiError": res.gemini_error.clone(),
+            }));
 
             let response = CompletionResponse {
                 request_id,
@@ -949,6 +1118,10 @@ async fn completions_handler(
                 "❌ [completion_error] requestId={}, error={}",
                 request_id, err
             );
+            log_event("completion_error", json!({
+                "requestId": &request_id,
+                "error": &err,
+            }));
             (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({
