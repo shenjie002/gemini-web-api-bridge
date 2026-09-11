@@ -13,19 +13,14 @@ export default defineConfig({
     },
     permissions: [
       'storage',
-      'tabs',
-      'scripting',
-      'webRequest',
-      'declarativeNetRequest',
+      'cookies',
     ],
     host_permissions: [
       'https://gemini.google.com/*',
-      'https://alkalimakersuite-pa.clients6.google.com/*',
+      'https://*.google.com/*',
       'http://localhost/*',
       'http://127.0.0.1/*',
     ],
   },
-  runner: {
-    startUrls: ['https://gemini.google.com/'],
-  },
+  runner: {},
 });

@@ -4,5 +4,11 @@ nohup.out
 .env
 .DS_Store
 tmp/
+logs/
 .wxt/
 wxt.config.ts.timestamp
+
+
+# Added by cargo
+
+target/

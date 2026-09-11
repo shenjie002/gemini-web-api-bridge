@@ -22,6 +22,14 @@
       gap: 8px;
     }
     h1 .icon { font-size: 20px; }
+    .badge {
+      font-size: 10px;
+      background: #2d4a2d;
+      color: #4caf50;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-weight: normal;
+    }
     .field {
       margin-bottom: 14px;
     }
@@ -95,32 +103,57 @@
       font-size: 12px;
       background: #16213e;
       border: 1px solid #333;
+      line-height: 1.5;
     }
     .status.connected { border-color: #4caf50; color: #4caf50; }
     .status.disconnected { border-color: #f44336; color: #f44336; }
     .status.idle { border-color: #666; color: #888; }
-    .btn {
+    .status.warning { border-color: #ff9800; color: #ff9800; }
+    .btn-row {
+      display: flex;
+      gap: 8px;
       margin-top: 12px;
-      width: 100%;
+    }
+    .btn {
+      flex: 1;
       padding: 8px;
       border: none;
       border-radius: 6px;
-      background: #8ab4f8;
-      color: #1a1a2e;
       font-size: 13px;
       font-weight: 600;
       cursor: pointer;
     }
-    .btn:hover { background: #6ea1f7; }
-    .stats {
+    .btn:hover { opacity: 0.85; }
+    .btn-primary {
+      background: #8ab4f8;
+      color: #1a1a2e;
+    }
+    .btn-secondary {
+      background: #333;
+      color: #e0e0e0;
+    }
+    .cookie-info {
       margin-top: 12px;
       font-size: 11px;
       color: #888;
+      line-height: 1.6;
     }
+    .cookie-info .label {
+      color: #aaa;
+    }
+    .cookie-info .value {
+      color: #8ab4f8;
+    }
+    .cookie-info .value.ok { color: #4caf50; }
+    .cookie-info .value.missing { color: #f44336; }
   </style>
 </head>
 <body>
-  <h1><span class="icon">🌉</span> Gemini Web API Bridge</h1>
+  <h1>
+    <span class="icon">🌉</span>
+    Gemini API Bridge
+    <span class="badge">Direct API</span>
+  </h1>
 
   <div class="toggle-row">
     <span>Enable Bridge</span>
@@ -136,18 +169,21 @@
   </div>
 
   <div class="toggle-row">
-    <span>Auto-capture Cookies</span>
+    <span>Auto-sync Cookies</span>
     <label class="switch">
       <input type="checkbox" id="cookieToggle" />
       <span class="slider"></span>
     </label>
   </div>
 
-  <button class="btn" id="testBtn">Test Connection</button>
+  <div class="btn-row">
+    <button class="btn btn-primary" id="syncBtn">🔄 Sync Cookies Now</button>
+    <button class="btn btn-secondary" id="testBtn">Test</button>
+  </div>
 
   <div class="status idle" id="statusBox">Not connected</div>
 
-  <div class="stats" id="stats"></div>
+  <div class="cookie-info" id="cookieInfo"></div>
 
   <script type="module" src="./main.ts"></script>
 </body>

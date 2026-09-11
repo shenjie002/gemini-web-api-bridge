@@ -1,18 +1,18 @@
 /**
- * Background Service Worker — Bidirectional Bridge
+ * Background Service Worker — Cookie Sync Bridge
  *
- * Responsibilities:
- * 1. Poll server for pending prompts → dispatch to content script
- * 2. Receive bridge responses from content script → post back to server
- * 3. Manage config, forward passive captures (legacy)
+ * New simplified architecture:
+ * 1. Periodically extract Gemini cookies from the browser
+ * 2. Sync cookies to the local bridge server
+ * 3. Server handles API calls directly (no more DOM injection)
  */
 import { storage } from 'wxt/storage';
 
 const TAG = '[GeminiBridge][BG]';
-const POLL_INTERVAL = 2000; // ms
+const COOKIE_SYNC_INTERVAL = 30_000; // 30s — cookies don't change often
 
 export default defineBackground(() => {
-  console.log(`${TAG} Background service worker started`);
+  console.log(`${TAG} Background service worker started (direct API mode)`);
 
   // ── Config ─────────────────────────────────────────────────────
   const defaultConfig: BridgeConfig = {
@@ -33,7 +33,7 @@ export default defineBackground(() => {
     return updated;
   }
 
-  // ── Message handler from content / popup ────────────────────────
+  // ── Message handler from popup ─────────────────────────────────
   browser.runtime.onMessage.addListener(
     (message: BridgeMessage, sender, sendResponse) => {
       handleMessage(message, sender)
@@ -54,25 +54,11 @@ export default defineBackground(() => {
       case 'SET_CONFIG':
         return setConfig(message.payload);
 
-      case 'GEMINI_REQUEST_CAPTURED':
-        return forwardLegacy('/api/gemini/request', message.payload);
+      case 'SYNC_COOKIES_NOW':
+        return syncCookies();
 
-      case 'GEMINI_RESPONSE_CAPTURED':
-        return forwardLegacy('/api/gemini/response', message.payload);
-
-      // Content script finished injecting + capturing response
-      case 'BRIDGE_RESPONSE': {
-        const { requestId, text } = message.payload as BridgePromptResponse;
-        console.log(`${TAG} BRIDGE_RESPONSE rid=${requestId.slice(0, 8)} len=${text.length}`);
-        return postResult(requestId, text, null);
-      }
-
-      // Content script encountered an error
-      case 'BRIDGE_ERROR': {
-        const { requestId, error } = message.payload as BridgePromptError;
-        console.error(`${TAG} BRIDGE_ERROR rid=${requestId.slice(0, 8)} err=${error}`);
-        return postResult(requestId, null, error);
-      }
+      case 'GET_COOKIE_STATUS':
+        return getCookieStatus();
 
       case 'PING':
         return { status: 'alive' };
@@ -82,180 +68,131 @@ export default defineBackground(() => {
     }
   }
 
-  // ── Post result back to server ─────────────────────────────────
-  async function postResult(
-    requestId: string,
-    text: string | null,
-    error: string | null
-  ) {
-    const config = await getConfig();
-    const body: any = { requestId };
-    if (error) body.error = error;
-    else body.text = text;
+  // ── Cookie Extraction ──────────────────────────────────────────
 
-    try {
-      const resp = await fetch(`${config.serverUrl}/api/bridge/result`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      return await resp.json();
-    } catch (err: any) {
-      console.error(`${TAG} postResult failed:`, err);
-      return { error: err.message };
-    }
-  }
-
-  // ── Legacy forward (passive capture) ───────────────────────────
-  async function forwardLegacy(path: string, payload: any) {
-    const config = await getConfig();
-    if (!config.enabled) return { skipped: true, reason: 'Bridge is disabled' };
-
-    try {
-      const resp = await fetch(`${config.serverUrl}${path}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      return await resp.json();
-    } catch (err: any) {
-      console.error(`${TAG} forwardLegacy ${path} failed:`, err);
-      return { error: err.message };
-    }
-  }
-
-  // ── Polling loop: fetch pending prompts from server ────────────
-  let polling = false;
-
-  async function pollOnce() {
-    const config = await getConfig();
-    if (!config.enabled) return;
-
-    try {
-      const resp = await fetch(`${config.serverUrl}/api/bridge/pending`, {
-        method: 'GET',
-        headers: { Accept: 'application/json' },
-      });
-      if (!resp.ok) return;
-
-      const data = await resp.json();
-      if (!data.requestId) return; // nothing pending
-
-      console.log(
-        `${TAG} Got pending prompt rid=${data.requestId.slice(0, 8)} len=${data.prompt.length}`
-      );
-
-      // Find Gemini tab and dispatch to content script
-      const dispatched = await dispatchToGeminiTab(data.requestId, data.prompt);
-      if (!dispatched) {
-        // No Gemini tab found — send error back
-        await postResult(
-          data.requestId,
-          null,
-          'No active Gemini tab found. Please open https://gemini.google.com/'
-        );
-      }
-    } catch (err: any) {
-      // Server not reachable — silently ignore
-      if (!err.message?.includes('Failed to fetch')) {
-        console.warn(`${TAG} Poll error:`, err.message);
-      }
-    }
-  }
-
-  async function injectContentScripts(tabId: number): Promise<void> {
-    console.log(`${TAG} Injecting content scripts into tab ${tabId}`);
-    try {
-      // Inject the MAIN world content script first
-      await browser.scripting.executeScript({
-        target: { tabId },
-        files: ['content-scripts/content.js'],
-        world: 'MAIN' as any,
-      });
-    } catch (err: any) {
-      console.warn(`${TAG} Failed to inject MAIN content script:`, err.message);
-    }
-    try {
-      // Then inject the ISOLATED world relay script
-      await browser.scripting.executeScript({
-        target: { tabId },
-        files: ['content-scripts/bridge-relay.js'],
-      });
-    } catch (err: any) {
-      console.warn(`${TAG} Failed to inject relay script:`, err.message);
-    }
-    // Give scripts a moment to initialize
-    await new Promise((r) => setTimeout(r, 500));
-  }
-
-  async function dispatchToGeminiTab(
-    requestId: string,
-    prompt: string
-  ): Promise<boolean> {
-    const tabs = await browser.tabs.query({
-      url: 'https://gemini.google.com/*',
+  async function extractGeminiCookies(): Promise<browser.Cookies.Cookie[]> {
+    // Query by URL — this is the most reliable way in Chrome's cookies API
+    const cookies = await browser.cookies.getAll({
+      url: 'https://gemini.google.com',
     });
 
-    if (tabs.length === 0) {
-      console.warn(`${TAG} No Gemini tabs found`);
-      return false;
-    }
+    console.log(`${TAG} Extracted ${cookies.length} cookies for gemini.google.com`);
 
-    // Use the first active Gemini tab
-    const tab = tabs.find((t) => t.active) || tabs[0];
-    if (!tab.id) return false;
+    // If gemini.google.com has few cookies, also grab .google.com domain cookies
+    if (cookies.length < 5) {
+      const googleCookies = await browser.cookies.getAll({
+        url: 'https://www.google.com',
+      });
+      console.log(`${TAG} Also found ${googleCookies.length} cookies from google.com`);
 
-    console.log(`${TAG} Dispatching to tab ${tab.id}: ${tab.url?.slice(0, 60)}`);
-
-    // Try sending message; if it fails, inject scripts and retry once
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        await browser.tabs.sendMessage(tab.id, {
-          type: 'INJECT_PROMPT',
-          payload: { requestId, prompt },
-        } as BridgeMessage);
-        return true;
-      } catch (err: any) {
-        if (attempt === 0) {
-          console.warn(`${TAG} sendMessage failed (attempt 1), injecting scripts and retrying...`);
-          await injectContentScripts(tab.id);
-        } else {
-          console.error(`${TAG} Failed to send to tab ${tab.id} after re-injection:`, err.message);
-          return false;
+      // Merge, deduplicate by name
+      const seen = new Set(cookies.map(c => c.name));
+      for (const c of googleCookies) {
+        if (!seen.has(c.name)) {
+          cookies.push(c);
+          seen.add(c.name);
         }
       }
     }
-    return false;
+
+    console.log(`${TAG} Total cookies to sync: ${cookies.length}`);
+    return cookies;
   }
 
-  function startPolling() {
-    if (polling) return;
-    polling = true;
-    console.log(`${TAG} Polling started (interval=${POLL_INTERVAL}ms)`);
+  async function syncCookies(): Promise<{ ok: boolean; cookieCount?: number; error?: string }> {
+    const config = await getConfig();
+    if (!config.enabled) {
+      return { ok: false, error: 'Bridge is disabled' };
+    }
 
-    const loop = async () => {
-      while (polling) {
-        await pollOnce();
-        await new Promise((r) => setTimeout(r, POLL_INTERVAL));
+    try {
+      const cookies = await extractGeminiCookies();
+
+      if (cookies.length === 0) {
+        return { ok: false, error: 'No Gemini cookies found. Make sure you are logged in to gemini.google.com' };
       }
-    };
-    loop();
+
+      // Send cookies to local server
+      const cookieString = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+
+      const resp = await fetch(`${config.serverUrl}/api/cookies`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cookies: cookieString }),
+      });
+
+      const result = await resp.json();
+
+      if (result.ok) {
+        console.log(`${TAG} Cookies synced: ${cookies.length} cookies, ${cookieString.length} chars`);
+        await storage.setItem('local:lastCookieSync', Date.now());
+        return { ok: true, cookieCount: cookies.length };
+      } else {
+        return { ok: false, error: result.error || 'Server rejected cookies' };
+      }
+
+    } catch (err: any) {
+      console.error(`${TAG} Cookie sync failed:`, err.message);
+      return { ok: false, error: err.message };
+    }
   }
 
-  function stopPolling() {
-    polling = false;
-    console.log(`${TAG} Polling stopped`);
+  async function getCookieStatus(): Promise<any> {
+    const config = await getConfig();
+    try {
+      const resp = await fetch(`${config.serverUrl}/api/cookies/status`);
+      const serverStatus = await resp.json();
+      const lastSync = await storage.getItem<number>('local:lastCookieSync');
+      const cookies = await extractGeminiCookies();
+
+      return {
+        browserCookieCount: cookies.length,
+        lastSync: lastSync ? new Date(lastSync).toISOString() : null,
+        server: serverStatus,
+      };
+    } catch (err: any) {
+      return {
+        browserCookieCount: 0,
+        lastSync: null,
+        server: { error: err.message },
+      };
+    }
   }
 
-  // Start polling on load; will silently skip if disabled or server unreachable
-  startPolling();
+  // ── Cookie Sync Loop ───────────────────────────────────────────
+  let syncing = false;
 
-  // Re-evaluate polling when config changes
+  async function syncLoop() {
+    while (syncing) {
+      const config = await getConfig();
+      if (config.enabled && config.autoCaptureCookies) {
+        await syncCookies();
+      }
+      await new Promise(r => setTimeout(r, COOKIE_SYNC_INTERVAL));
+    }
+  }
+
+  function startSync() {
+    if (syncing) return;
+    syncing = true;
+    console.log(`${TAG} Cookie sync started (interval=${COOKIE_SYNC_INTERVAL}ms)`);
+    syncLoop();
+  }
+
+  function stopSync() {
+    syncing = false;
+    console.log(`${TAG} Cookie sync stopped`);
+  }
+
+  // Start sync on load
+  startSync();
+
+  // Re-evaluate when config changes
   storage.watch<BridgeConfig>('local:bridgeConfig', (newVal) => {
     if (newVal?.enabled) {
-      startPolling();
+      startSync();
     } else {
-      stopPolling();
+      stopSync();
     }
   });
 });
