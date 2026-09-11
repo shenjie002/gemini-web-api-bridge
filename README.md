@@ -438,6 +438,12 @@ If the server reports that cookies are unavailable, log in to Gemini, enable the
 
 Browser cookies are authentication credentials. Never commit or publicly share them. The server binds to `0.0.0.0:3456` by default, so use it only in a trusted environment or put authentication and network controls in front of it when exposing it beyond the local machine.
 
-## License
+## ⚠️ License & Usage Terms (授权与使用协议)
 
-MIT License.
+本项目采用 **Source-Available License（公开源码专有协议）**：
+
+1. **仅限个人学习与审计**：代码公开仅供个人学习、代码审查与技术评估。
+2. **使用与商用需授权**：未经原作者显式书面许可，严禁将本项目（包含全部或部分代码）用于生产环境部署、实际业务运行、二次分发或商业运营。
+3. **授权联系**：如需使用、部署或商业授权，请联系作者邮箱：`sjie13684@gmail.com`。
+
+完整协议内容请查阅根目录 [LICENSE](./LICENSE) 文件。
